@@ -11,9 +11,10 @@
     @author Vincent Cheung(VincentCheungm)
     @bug .
 */
-
+#define IO
 #include <iostream>
-// For disable PCL complile lib, to use PointXYZIR, and custome pointcloud    
+#include <forward_list>
+// For disable PCL complile lib, to use PointXYZIR, and customized pointcloud    
 #define PCL_NO_PRECOMPILE
 
 #include <ros/ros.h>
@@ -23,17 +24,21 @@
 #include <pcl/filters/filter.h>
 #include <pcl/point_types.h>
 #include <velodyne_pointcloud/point_types.h>
-#include <pcl/octree/octree.h>
-#include <pcl/octree/impl/octree_search.hpp>
-#include <set>
 
+
+#ifdef MARKER
 #include <visualization_msgs/Marker.h>
 #include <visualization_msgs/MarkerArray.h>
+#endif
+
 #include <pcl/common/common.h>
 #include <pcl/common/centroid.h>
 
+#ifdef IO
 #include <pcl/io/pcd_io.h>
 #include <boost/format.hpp>
+#endif
+
 using namespace std;
 
 //Customed Point Struct for holding clustered points
@@ -63,6 +68,8 @@ POINT_CLOUD_REGISTER_POINT_STRUCT(scan_line_run::PointXYZIRL,
                                   (uint16_t, ring, ring)
                                   (uint16_t, label, label))
 
+#define dist(a,b) sqrt(((a).x-(b).x)*((a).x-(b).x)+((a).y-(b).y)*((a).y-(b).y))
+
 /*
     @brief Scan Line Run ROS Node.
     @param Velodyne Pointcloud Non Ground topic.
@@ -70,8 +77,8 @@ POINT_CLOUD_REGISTER_POINT_STRUCT(scan_line_run::PointXYZIRL,
     @param Threshold between points belong to the same run
     @param Threshold between runs
     
-    @subscirbe:/points_no_ground
-    @publish:/cluster
+    @subscirbe:/all_points
+    @publish:/slr
 */
 class ScanLineRun{
 public:
@@ -84,21 +91,44 @@ private:
 
     std::string point_topic_;
 
-    int sensor_model_;// also means number of sensor scan line
-    double th_run_;
-    double th_merge_;
+    int sensor_model_;// also means number of sensor scan line.
+    double th_run_;// thresold of distance of points belong to the same run.
+    double th_merge_;// threshold of distance of runs to be merged.
 
-    std::vector<pcl::PointCloud<SLRPointXYZIRL>::Ptr > laserCloudScans_;// holding all lines
-    std::vector<RUN::Ptr> runs_;// holding all runs
-    std::vector<std::vector<int> > line_run_idx_;// holding run labels on each line
-    int label_;// run labels
+    // For organization of points.
+    std::vector<std::vector<SLRPointXYZIRL> > laser_frame_;
+    std::vector<SLRPointXYZIRL> laser_row_;
+    
+    std::vector<std::forward_list<SLRPointXYZIRL*> > runs_;// For holding all runs.
+    uint16_t max_label_;// max run labels, for disinguish different runs.
+    std::vector<std::vector<int> > ng_idx_;// non ground point index.
 
+    // Call back funtion.
     void velodyne_callback_(const sensor_msgs::PointCloud2ConstPtr& laserCloudMsg);
-    void find_runs_(int ring);
-    void update_labels_(int ring);
-    // void extract_clusters_(void);
-    // Model parameter for ground plane fitting
+    // For finding runs on a scanline.
+    void find_runs_(int scanline);
+    // For update points cluster label after merge action.
+    void update_labels_(int scanline);
+    // For merge `current` run to `target` run.
+    void merge_runs_(uint16_t cur_label, uint16_t target_label);
+    
+    /// @deprecated methods for smart index
+    // Smart idx according to paper, but not useful in my case.
+    int smart_idx_(int local_idx, int n_i, int n_j, bool inverse);
+
+#ifdef MARKER
+    // For display markers only, however, currently the orientation is bad.
     ros::Publisher marker_array_pub_;
+#endif
+    // Dummy object to occupy idx 0.
+    std::forward_list<SLRPointXYZIRL*> dummy_;
+
+    
+#ifdef INTEREST_ONLY
+    // For showing interest and index point
+    int interest_line_;
+    int interest_idx_;
+#endif
 };    
 
 /*
@@ -108,214 +138,286 @@ private:
 ScanLineRun::ScanLineRun():node_handle_("~"){
     // Init ROS related
     ROS_INFO("Inititalizing Scan Line Run Cluster...");
-    node_handle_.param<std::string>("point_topic", point_topic_, "/points_no_ground");
+    node_handle_.param<std::string>("point_topic", point_topic_, "/all_points");
     ROS_INFO("point_topic: %s", point_topic_.c_str());
 
     node_handle_.param("sensor_model", sensor_model_, 32);
     ROS_INFO("Sensor Model: %d", sensor_model_);
-    // Init Ptrs
+    
+    // Init Ptrs with vectors
     for(int i=0;i<sensor_model_;i++){
-        // sensor_model_ lines
-        pcl::PointCloud<SLRPointXYZIRL>::Ptr item( new pcl::PointCloud<SLRPointXYZIRL>());
-        laserCloudScans_.push_back(item);
-        std::vector<int> idx_item;
-        line_run_idx_.push_back(idx_item);
+        std::vector<int> dummy_vec;
+        ng_idx_.push_back(dummy_vec);
     }
 
-    node_handle_.param("th_run", th_run_, 0.2);
+    // Init LiDAR frames with vectors and points
+    SLRPointXYZIRL p_dummy;
+    p_dummy.intensity = -1;// Means unoccupy by any points
+    laser_row_ = std::vector<SLRPointXYZIRL>(2251, p_dummy);
+    laser_frame_ = std::vector<std::vector<SLRPointXYZIRL> >(32, laser_row_);
+    
+    // Init runs, idx 0 for interest point, and idx for ground points
+    max_label_ = 1;
+    runs_.push_back(dummy_);
+    runs_.push_back(dummy_);
+
+    node_handle_.param("th_run", th_run_, 0.15);
     ROS_INFO("Point-to-Run Threshold: %f", th_run_);
 
-    node_handle_.param("th_merge", th_merge_, 0.8);
+    node_handle_.param("th_merge", th_merge_, 0.5);
     ROS_INFO("RUN-to-RUN Distance Threshold: %f", th_merge_);
 
-    // Listen to velodyne topic
+    // Subscriber to velodyne topic
     points_node_sub_ = node_handle_.subscribe(point_topic_, 2, &ScanLineRun::velodyne_callback_, this);
     
-    // Publish Init
-    std::string cluster_topic, ring_topic;
+    // Publisher Init
+    std::string cluster_topic;
     node_handle_.param<std::string>("cluster", cluster_topic, "/slr");
-    ROS_INFO("Cluster Output Point Cloud: %s", cluster_topic.c_str());
-    // node_handle_.param<std::string>("ring_point_topic_for_debug", ring_topic, "/ring");
-    // ROS_INFO("ring_point_topic_for_debug Output Point Cloud: %s", ring_topic.c_str());
-    
+    ROS_INFO("Cluster Output Point Cloud: %s", cluster_topic.c_str());   
     cluster_points_pub_ = node_handle_.advertise<sensor_msgs::PointCloud2 >(cluster_topic, 10);
-    // ground_points_pub_ = node_handle_.advertise<sensor_msgs::PointCloud2>(ring_topic, 2);
+    
+#ifdef MARKER
+    // Publisher for markers.
+    ROS_INFO("Publishing jsk markers at: %s", "cluster_ma");
     marker_array_pub_ = node_handle_.advertise<visualization_msgs::MarkerArray>("cluster_ma", 10);
+#endif
+
+    
+#ifdef INTEREST_ONLY
+    // For showing interest point and its neighbour points only.
+    ROS_INFO("Showing interested points only, starts from line: %d idx: %d", interest_line_, interest_idx_);
+    node_handle_.param("line", interest_line_, 16);
+    node_handle_.param("idx", interest_idx_, 500);
+#endif
 }
 
 
 /*
-    @brief Read Points from the given scan_line. Using Octree to construct a 
-    tree, and perform Radius Search on points. Points within radius will be labelled
-    to label of the lowest point. Points stored in `laserCloudScans_[scan_line]`. 
+    @brief Read points from the given scan_line. 
+    The distance of two continuous points will be labelled to the same run. 
+    Clusterred points(`Runs`) stored in `runs_[cluster_id]`. 
     
-    @param scan_line: the scan line to find runs.
+    @param scan_line: The scan line to find runs.
+    @return void
 */
 void ScanLineRun::find_runs_(int scan_line){
-    float resolution = 32.0f;
-    pcl::octree::OctreePointCloudSearch<SLRPointXYZIRL> octree (resolution);
-    octree.setInputCloud(laserCloudScans_[scan_line]);
-    octree.addPointsFromInputCloud();   
-    // Neighbors within radius search
-    std::vector<int> pointIdxRadiusSearch;
-    std::vector<float> pointRadiusSquaredDistance;
-    SLRPointXYZIRL searchPoint;
-    SLRPointXYZIRL first_point;
-    SLRPointXYZIRL last_point;
-    uint16_t target_label = 0;
+    // If there is no non-ground points of current scanline, skip.
+    int point_size = ng_idx_[scan_line].size();
+    if(point_size<=0)
+        return;
 
-    // This will mark or nearest neighbour of search point from Octree Radius Search.
-    // Radius search is perform on every points, and then points will be labeled and cluster into runs_.
+    int non_g_pt_idx = ng_idx_[scan_line][0]; // The first non ground point
+    int non_g_pt_idx_l = ng_idx_[scan_line][point_size - 1]; // The last non ground point
 
-    for(size_t idx =0; idx<laserCloudScans_[scan_line]->points.size();idx++){
-        // iterate each point to search
-        searchPoint = laserCloudScans_[scan_line]->points[idx];
-        if(searchPoint.label != 0){
-            // this point has been iterated, skip this point           
+    /* Iterate all non-ground points, and compute and compare the distance 
+    of each two continous points. At least two non-ground points are needed.
+    */
+    for(int i_idx=0;i_idx<point_size-1;i_idx++){
+        int i = ng_idx_[scan_line][i_idx];
+        int i1 = ng_idx_[scan_line][i_idx+1];
+
+        if(i_idx == 0){
+            // The first point, make a new run.
+            auto &p_0 = laser_frame_[scan_line][i];
+            max_label_ += 1;
+            runs_.push_back(dummy_);
+            laser_frame_[scan_line][i].label = max_label_;
+            runs_[p_0.label].insert_after(runs_[p_0.label].cbefore_begin(), &laser_frame_[scan_line][i]);
+
+            if(p_0.label == 0)
+                ROS_ERROR("p_0.label == 0");
+        }
+
+        // Compare with the next point
+        auto &p_i = laser_frame_[scan_line][i];
+        auto &p_i1 = laser_frame_[scan_line][i1];
+
+        // If next point is ground point, skip.
+        if(p_i1.label == 1u){
+            // Add to ground run `runs_[1]`
+            runs_[p_i1.label].insert_after(runs_[p_i1.label].cbefore_begin(), &laser_frame_[scan_line][i1]);
             continue;
         }
 
-        
-        // if search, marked the points into a run
-        // Here mared all nearest neighbour points into a run
-        if(octree.radiusSearch(searchPoint, th_run_, pointIdxRadiusSearch, pointRadiusSquaredDistance)){
-            sort(pointIdxRadiusSearch.begin(),pointIdxRadiusSearch.end());
-            // if the first point and the last point are not cluster, label it to 1 as the first cluster
-            first_point = laserCloudScans_[scan_line]->points[pointIdxRadiusSearch[0]];
-            last_point = laserCloudScans_[scan_line]->points[pointIdxRadiusSearch[pointIdxRadiusSearch.size()-1]];
-            
-            if(first_point.label == 0 && last_point.label == 0){
-                // Adding new run, none of points has been labeled.
-                RUN::Ptr item(new RUN());
-                runs_.push_back(item);
-                target_label = ++label_;
-                line_run_idx_[scan_line].push_back(target_label);
-            }else if(last_point.label == 0){
-                // the early points has been visited
-                target_label = first_point.label;
-            }else if(first_point.label == 0){
-                // the later points has been visited, happend at the end of circle
-                target_label = last_point.label;
-            }else{
-                // otherwise, take the small one as label. For smallest label comes from the bottom scan_line
-                target_label = min(first_point.label, last_point.label);
-            }
-            // set point label
-            for (size_t i = 1; i < pointIdxRadiusSearch.size(); ++i){
-                // try not to make data dirty
-                // set new label and adding to run
-                if(laserCloudScans_[scan_line]->points[pointIdxRadiusSearch[i]].label != target_label){
-                    laserCloudScans_[scan_line]->points[pointIdxRadiusSearch[i]].label = target_label;
-                    runs_[target_label-1]->push_back(laserCloudScans_[scan_line]->points[pointIdxRadiusSearch[i]]);
-                }
-            } 
+        /* If cur point is not ground and next point is within threshold, 
+        then make it the same run.
+           Else, to make a new run.
+        */
+        if(p_i.label != 1u && dist(p_i,p_i1) < th_run_){
+            p_i1.label = p_i.label; 
+        }else{
+            max_label_ += 1;
+            p_i1.label = max_label_;
+            runs_.push_back(dummy_);
         }
 
+        // Insert the index.
+        runs_[p_i1.label].insert_after(runs_[p_i1.label].cbefore_begin(), &laser_frame_[scan_line][i1]);
+        
+        if(p_i1.label == 0)
+            ROS_ERROR("p_i1.label == 0");    
+    }
+    
+    // Compare the last point and the first point, for laser scans is a ring.
+    if(point_size>1){
+        auto &p_0 = laser_frame_[scan_line][non_g_pt_idx];
+        auto &p_l = laser_frame_[scan_line][non_g_pt_idx_l];
+
+        // Skip, if one of the start point or the last point is ground point.
+        if(p_0.label == 1u || p_l.label == 1u){
+            return ;
+        }else if(dist(p_0,p_l) < th_run_){
+            if(p_0.label==0){
+                ROS_ERROR("Ring Merge to 0 label");
+            }
+            /// If next point is within threshold, then merge it into the same run.
+            merge_runs_(p_l.label, p_0.label);
+        }
+    }else if(point_size == 1){
+            // The only point, make a new run.
+            auto &p_0 = laser_frame_[scan_line][non_g_pt_idx];
+            max_label_ += 1;
+            runs_.push_back(dummy_);
+            laser_frame_[scan_line][non_g_pt_idx].label = max_label_;
+            runs_[p_0.label].insert_after(runs_[p_0.label].cbefore_begin(), &laser_frame_[scan_line][non_g_pt_idx]);
+    }
+    
+}
+
+
+/*
+    @brief Update label between points and their smart `neighbour` point
+    above `scan_line`.
+
+    @param scan_line: The current scan line number.
+*/
+void ScanLineRun::update_labels_(int scan_line){
+    // Iterate each point of this scan line to update the labels.
+    int point_size_j_idx = ng_idx_[scan_line].size();
+    // Current scan line is emtpy, do nothing.
+    if(point_size_j_idx==0) return;
+
+    // Iterate each point of this scan line to update the labels.
+    for(int j_idx=0;j_idx<point_size_j_idx;j_idx++){
+        int j = ng_idx_[scan_line][j_idx];
+
+        auto &p_j = laser_frame_[scan_line][j];
+
+        // Runs above from scan line 0 to scan_line
+        for(int l=scan_line-1;l>=0;l--){
+            if(ng_idx_[l].size()==0)
+                continue;
+
+            // Smart index for the near enough point, after re-organized these points.
+            int nn_idx = j;
+
+            if(laser_frame_[l][nn_idx].intensity ==-1 || laser_frame_[l][nn_idx].label == 1u){
+                continue;
+            }
+
+            // Nearest neighbour point
+            auto &p_nn = laser_frame_[l][nn_idx];
+            // Skip, if these two points already belong to the same run.
+            if(p_j.label == p_nn.label){
+                continue;
+            }
+            double dist_min = dist(p_j, p_nn);
+
+            /* Otherwise,
+            If the distance of the `nearest point` is within `th_merge_`, 
+            then merge to the smaller run.
+            */
+            if(dist_min < th_merge_){
+                uint16_t  cur_label = 0, target_label = 0;
+
+                if(p_j.label ==0 || p_nn.label==0){
+                    ROS_ERROR("p_j.label:%u, p_nn.label:%u", p_j.label, p_nn.label);
+                }
+                // Merge to a smaller label cluster
+                if(p_j.label > p_nn.label){
+                    cur_label = p_j.label;
+                    target_label = p_nn.label;
+                }else{
+                    cur_label = p_nn.label;
+                    target_label = p_j.label;
+                }
+
+                // Merge these two runs.
+                merge_runs_(cur_label, target_label);
+            }
+        }
     }
 
 }
 
 /*
-    @brief Update label between two runs.
+    @brief Merge current run to the target run.
+
+    @param cur_label: The run label of current run.
+    @param target_label: The run label of target run.
 */
-void ScanLineRun::update_labels_(int scan_line){
-    // runs above 
-    pcl::PointCloud<SLRPointXYZIRL>::Ptr run_above(new pcl::PointCloud<SLRPointXYZIRL>());
-    for(auto run_id_above_line:line_run_idx_[scan_line-1]){
-        // cout<<"i:"<<i<<" ";
-        *run_above += *(runs_[run_id_above_line-1]);
+void ScanLineRun::merge_runs_(uint16_t cur_label, uint16_t target_label){
+    if(cur_label ==0||target_label==0){
+        ROS_ERROR("Error merging runs cur_label:%u target_label:%u", cur_label, target_label);
     }
-    // Octree search
-    float resolution = 32.0f;
-    pcl::octree::OctreePointCloudSearch<SLRPointXYZIRL> octree(resolution);
-    octree.setInputCloud(run_above);
-    octree.addPointsFromInputCloud();
-    // Neighbors within radius search
-    std::vector<int> pointIdxRadiusSearch;
-    std::vector<float> pointRadiusSquaredDistance;   
-    // Temp var to be used later. Need init for every iterate.
-    SLRPointXYZIRL searchPoint;
-    RUN::Ptr run_current;
-    std::set<uint16_t> label_to_merge;
-    uint16_t target_label = 0;
-    // Used for merge labels. 
-    std::set<int> new_label;
-
-    for(auto run_in_line:line_run_idx_[scan_line]){
-        run_current = runs_[run_in_line-1];
-        target_label = 0;
-        // Clear label_to_merge
-        label_to_merge.clear();
-
-        for(int p_idx=0;p_idx<run_current->points.size();p_idx++){
-            searchPoint = run_current->points[p_idx];
-            // search the nearest point to merge
-            // get the nearest point within th_merge_ to merge
-            if(octree.radiusSearch(searchPoint, th_merge_, pointIdxRadiusSearch, pointRadiusSquaredDistance, 1)>0){
-                label_to_merge.insert(run_above->points[pointIdxRadiusSearch[0]].label);
-                if(target_label ==0){
-                    target_label = run_above->points[pointIdxRadiusSearch[0]].label;
-                }else{
-                    target_label = min(target_label, run_above->points[pointIdxRadiusSearch[0]].label);
-                }
-            }
-        }
-
-        // If label_to_merge is not empty, then update label
-        if(!label_to_merge.empty()){
-            // set current point to target label
-            for(int p_idx=0;p_idx<run_current->points.size();p_idx++){
-                run_current->points[p_idx].label = target_label;
-            }
-
-            // connect current run into the above target run
-            *runs_[target_label-1]+= *(run_current);
-            // remove current run
-            run_current->clear();
-            // Merge Other Run in the label_to_merge set, mentioned as `MergedLabel`.
-            // The conflict is solved according the the `two-run segmentation` paper.
-            // All run except for the target run, will be merged into target run.
-            RUN::Ptr run_to_merge;
-            for(auto label_id:label_to_merge){
-                // if the label_to_merge is not target_label,
-                // merge that run into target run.
-                if(label_id!=target_label && runs_[label_id-1]->points.size()>0){
-                    run_to_merge = runs_[label_id-1];
-                    // Update labels
-                    for(int p_idx=0;p_idx<run_to_merge->points.size();p_idx++){
-                        run_to_merge->points[p_idx].label = target_label;
-                    }
-                    // Merge into target run
-                    *runs_[target_label-1]+= *(run_to_merge);
-                    run_to_merge->clear();
-                }
-            }
-            // update label on the current run line
-            new_label.insert(target_label);
-            
-        }else{
-            // keep current run inside the line_run_idx
-            new_label.insert(run_in_line);
-            // Do nothing
-            // In this implmentation, the current Node has its own label after find_runs.
-        }
-
-
+    // First, modify the label of current run.
+    for(auto &p:runs_[cur_label]){
+        p->label = target_label;
     }
-    // Update the line_run_idx with merged label, so that it can be used in the next scan_line
-    // Here set it's used, to avoid multi-add label
-    std::vector<int> merged_label;
-    for(auto s:new_label){
-        merged_label.push_back(s);
-    }
-    // New run labels of current scan_line
-    line_run_idx_[scan_line] = merged_label;
-
+    // Then, insert points of current run into target run.
+    runs_[target_label].insert_after(runs_[target_label].cbefore_begin(), runs_[cur_label].begin(),runs_[cur_label].end() );
+    runs_[cur_label].clear();
 }
 
+/*
+    @brief Smart index for nearest neighbour on scanline `i` and scanline `j`.
 
-visualization_msgs::Marker mark_cluster(pcl::PointCloud<SLRPointXYZIRL>::Ptr cloud_cluster, std::string ns ,int id, float r, float g, float b) 
-{ 
+    @param local_idx: The local index of point on current scanline.
+    @param n_i: The number of points on scanline `i`.
+    @param n_j: The number of points on scanline `j`.
+    @param inverse: If true, means `local_idx` is on the outsider ring `j`.
+    Otherwise, it's on the insider ring `i`.
+    
+    @return The smart index.
+*/
+[[deprecated("Not useful in my case.")]] 
+int ScanLineRun::smart_idx_(int local_idx, int n_i, int n_j, bool inverse=false){
+    if(inverse==false){
+        // In case of zero-divide.
+        if(n_i == 0 ) return 0;
+        float rate = (n_j*1.0f)/n_i;
+        int idx = floor(rate*local_idx);
+
+        // In case of overflow
+        if(idx>n_j){
+            idx = n_j>1?n_j-1:0;
+        }
+        return idx;
+    }else{
+        // In case of zero-divide.
+        if(n_j == 0 ) return 0;
+        float rate = (n_i*1.0f)/n_j;
+        int idx = ceil(rate*local_idx);
+
+        // In case of overflow
+        if(idx>n_i){
+            idx = n_i>1?n_i-1:0;
+        }
+        return idx;
+    }
+    
+}
+
+#ifdef MARKER
+/*
+    @brief For making JSK-Markers with pointclouds.
+    @param cloud: The clusterred cloud to make a marker.
+    @param ns: The name string.
+    @param id: The marker id.
+    @param r,g,b: The clour of marker.
+*/
+visualization_msgs::Marker mark_cluster(pcl::PointCloud<SLRPointXYZIRL>::Ptr cloud_cluster, 
+    std::string ns ,int id, float r, float g, float b) { 
   Eigen::Vector4f centroid; 
   Eigen::Vector4f min; 
   Eigen::Vector4f max; 
@@ -363,100 +465,186 @@ visualization_msgs::Marker mark_cluster(pcl::PointCloud<SLRPointXYZIRL>::Ptr clo
 //   marker.lifetime = ros::Duration(0.5); 
   return marker; 
 }
+#endif
+
 
 #ifdef IO
 int tab=0;
 #endif
 
 /*
-    @brief Velodyne pointcloud callback function. The main GPF pipeline is here.
-    PointCloud SensorMsg -> Pointcloud -> z-value sorted Pointcloud
-    ->error points removal -> extract ground seeds -> ground plane fit mainloop
+    @brief Velodyne pointcloud callback function, which subscribe `/all_points`
+    and publish cluster points `slr`.
 */
 void ScanLineRun::velodyne_callback_(const sensor_msgs::PointCloud2ConstPtr& in_cloud_msg){
     // Msg to pointcloud
-    pcl::PointCloud<VPoint> laserCloudIn;
+    pcl::PointCloud<SLRPointXYZIRL> laserCloudIn;
     pcl::fromROSMsg(*in_cloud_msg, laserCloudIn);
-    std::vector<int> indices;
-    pcl::removeNaNFromPointCloud(laserCloudIn, laserCloudIn, indices);
 
-    // Clear points in the previous scan
-    runs_.clear();
-    label_ = 0;
+    /// Clear and init.
+    // Clear runs in the previous scan.
+    max_label_ = 1;
+    if(!runs_.empty()){
+        runs_.clear();
+        runs_.push_back(dummy_);// dummy for index `0`
+        runs_.push_back(dummy_);// for ground points
+    }
+    
+    // Init laser frame.
+    SLRPointXYZIRL p_dummy;
+    p_dummy.intensity = -1;
+    laser_row_ = std::vector<SLRPointXYZIRL> (2251, p_dummy);
+    laser_frame_ = std::vector<std::vector<SLRPointXYZIRL> >(32, laser_row_);
+    
+    // Init non-ground index holder.
     for(int i=0;i<sensor_model_;i++){
-        laserCloudScans_[i]->clear();
-        line_run_idx_[i].clear();
+        ng_idx_[i].clear();
     }
-    
-    // Organize Pointcloud in scanline
-    SLRPointXYZIRL point;
-    for(int i=0;i<laserCloudIn.points.size();i++){
-        point.x = laserCloudIn.points[i].x;
-        point.y = laserCloudIn.points[i].y;
-        point.z = laserCloudIn.points[i].z;
-        point.intensity = laserCloudIn.points[i].intensity;
-        point.ring = laserCloudIn.points[i].ring;
-        point.label = 0u;// 0 means uncluster
 
-        if(point.ring<=sensor_model_&&point.ring>=0){
-            laserCloudScans_[point.ring]->push_back(point);
-        }    
+#ifdef INTEREST_ONLY
+    interest_idx_ += 1;
+#endif
+
+    // Organize Pointcloud in scanline
+    double range = 0;
+    int row = 0;
+    for(auto &point:laserCloudIn.points){
+        if(point.ring<sensor_model_&&point.ring>=0){
+            
+#ifdef INTEREST_ONLY
+            // Set the intensity of non-interested points to zero.
+            point.intensity = 0;
+#endif
+            // Compute and angle. 
+            // @Note: In this case, `x` points right and `y` points forward.
+            range = sqrt(point.x*point.x + point.y*point.y + point.z*point.z);
+            if(point.x>=0){
+                row = int(563 - asin(point.y/range)/0.00279111);
+            }else if(point.x<0 && point.y <=0){
+                row = int(1688 + asin(point.y/range)/0.00279111);
+            }else {
+                row = int(1688 + asin(point.y/range)/0.00279111);
+            }
+
+            if(row>2250||row<0){
+                ROS_ERROR("Row: %d is out of index.", row);
+                return;
+            }else{
+                laser_frame_[point.ring][row] = point;
+            }
+            
+            if(point.label != 1u){
+                ng_idx_[point.ring].push_back(row);
+            }else{
+                runs_[1].insert_after(runs_[1].cbefore_begin(), &point);
+            }
+        } 
     }
-    
-    // Mainloop
-    // find run of the first scan line
-    find_runs_(0);
-    for(int i=1;i<sensor_model_;i++){
+
+
+    // Main processing
+    for(int i=0;i<sensor_model_;i++){
         // get runs on current scan line i
         find_runs_(i);
-        laserCloudScans_[i]->clear();
-        if(line_run_idx_[i-1].size()>0&&line_run_idx_[i].size()>0)
-            update_labels_(i);
-        // update labels between two runs
-        // iterate new run
+        update_labels_(i);
     }
     
+#ifdef INTEREST_ONLY
+    ROS_INFO("Showing interested points only line: %d idx: %d", interest_line_, interest_idx_);
+    
+    for(int i=interest_line_;i>=0;i--){
+        if(i==interest_line_){
+            auto &point_d = laser_frame_[i][interest_idx_];
+            // Empty dummy point
+            if(point_d.intensity == -1)
+                continue;
+            point_d.intensity = i;
+            // Add key point
+            runs_[0].insert_after(runs_[0].cbefore_begin(), &laser_frame_[i][interest_idx_]);
+        }else{
+            // Add neighbour point with smart idx
+            auto &point_d = laser_frame_[i][interest_idx_];
+            if(point_d.intensity == -1)
+                continue;
+            point_d.intensity = i;
+            // Add neighbour point
+            runs_[0].insert_after(runs_[0].cbefore_begin(), &laser_frame_[i][interest_idx_]);
+        }
+    }
+#endif
     // Extract Clusters
     // re-organize scan-line points into cluster point cloud
     pcl::PointCloud<SLRPointXYZIRL>::Ptr laserCloud(new pcl::PointCloud<SLRPointXYZIRL>());
+    pcl::PointCloud<SLRPointXYZIRL>::Ptr clusters(new pcl::PointCloud<SLRPointXYZIRL>());
 
 #ifdef IO
     // should be modified
-    boost::format fmt1("/media/es/beta/velodyne/Origin-PCD/%d_%d.%s");
+    std::string str_path = "./PCD";
+    if(!boost::filesystem::exists(str_path)){
+        boost::filesystem::create_directories(str_path);
+    }
+    boost::format fmt1(str_path + "/%d_%d.%s");
+    pcl::PointCloud<SLRPointXYZIRL>::Ptr to_save(new pcl::PointCloud<SLRPointXYZIRL>());
+    pcl::PointCloud<SLRPointXYZIRL>::Ptr to_save_all(new pcl::PointCloud<SLRPointXYZIRL>());
 #endif
-    // int id = 0;
-    // int id_s = 0;
-    // int not_zeros = 0;
-    // visualization_msgs::MarkerArray ma;
+
+#ifdef MARKER    
+    visualization_msgs::MarkerArray ma;
+#endif
+    int cnt = 0;
+
     // Re-organize pointcloud clusters for PCD saving or publish
-    for(int i=0;i<runs_.size();i++){
-        // if(runs_[i]->points.size()>id_s){
-        //     id = i;
-        //     id_s = runs_[i]->points.size();
-        // }
-        if(runs_[i]->points.size()!=0){
-            // cout<<"run id: "<<i<<" size: "<<runs_[i]->points.size()<<" not zero "<<runs_.size()<<endl;
-            // not_zeros++;
-#ifdef IO
-            pcl::io::savePCDFileBinary((fmt1%(tab)%(i)%"pcd").str(), *runs_[i]); 
-#endif      
+#ifdef INTEREST_ONLY
+    for(size_t i=0;i<1;i++){
+#else
+    for(size_t i=2;i<runs_.size();i++){
+#endif
+        if(!runs_[i].empty()){
+            cnt++;
+
+            int ccnt = 0;
             // adding run current for publishing
-            *laserCloud+=*runs_[i];
-            //visualization_msgs::Marker mac = mark_cluster(runs_[i],std::to_string(i),i,i/10,i/5,i*2);
-            //ma.markers.push_back(mac);
+            for(auto &p:runs_[i]){
+                // Reorder the label id
+                ccnt++;
+                p->label = cnt;
+                laserCloud->points.push_back(*p);
+                // clusters->points.push_back(*p);
+#ifdef IO
+                to_save_all->points.push_back(*p);
+                to_save->points.push_back(*p);
+#endif
+            }
+
+#ifdef IO
+            if(tab==1){
+                pcl::io::savePCDFileBinary((fmt1%(tab)%(cnt)%"pcd").str(), *to_save);
+                to_save->clear();
+            } 
+#endif   
+
+#ifdef INTEREST_ONLY
+            // Counting interested point and its neighbour points.
+            ROS_INFO("cluster i:%d, size:%d",i, ccnt);
+#endif
+            // clusters->clear();
         }
     }
-
+    ROS_INFO("Total cluster: %d", cnt);
     // Publish Cluster Points
     if(laserCloud->points.size()>0){
-        //*laserCloud+=*runs_[id];
-        //cout<<"largest id: "<<id<<" size: "<<id_s<<" runs_.size(): "<<not_zeros<<endl;
         sensor_msgs::PointCloud2 cluster_msg;
         pcl::toROSMsg(*laserCloud, cluster_msg);
         cluster_msg.header.frame_id = "/velodyne";
         cluster_points_pub_.publish(cluster_msg);
     }
 #ifdef IO
+    // Only save the clusterred results of the first frame.
+    if(tab==1){
+        to_save_all->height = to_save_all->points.size();
+        to_save_all->width = 1;
+        pcl::io::savePCDFileASCII((fmt1%(0)%(0)%"pcd").str(), *to_save_all);
+    }
     tab++;
 #endif
 }
