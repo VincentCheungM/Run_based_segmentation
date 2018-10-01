@@ -19,10 +19,12 @@ catkin_package(CATKIN_DEPENDS
 ###########
 
 include_directories(
-  Eigen
   ${catkin_INCLUDE_DIRS}
 )
 
+find_package(Eigen3 REQUIRED)
+
+#SET(CMAKE_CXX_FLAGS "-std=c++11 -O2 -g -Wall ${CMAKE_CXX_FLAGS}")
 SET(CMAKE_CXX_FLAGS "-std=c++11 -O2 -g -Wall ${CMAKE_CXX_FLAGS}")
 
 link_directories(${PCL_LIBRARY_DIRS})
