@@ -18,12 +18,42 @@
 
 #include <ros/ros.h>
 #include <sensor_msgs/PointCloud2.h>
+
 #include <pcl_ros/point_cloud.h>
 #include <pcl_conversions/pcl_conversions.h>
 #include <pcl/filters/filter.h>
 #include <pcl/point_types.h>
+#include <pcl/common/centroid.h>
+
 #include <velodyne_pointcloud/point_types.h>
+
+//Customed Point Struct for holding clustered points
+namespace scan_line_run
+{
+  /** Euclidean Velodyne coordinate, including intensity and ring number, and label. */
+  struct PointXYZIRL
+  {
+    PCL_ADD_POINT4D;                    // quad-word XYZ
+    float    intensity;                 ///< laser intensity reading
+    uint16_t ring;                      ///< laser ring number
+    uint16_t label;                     ///< point label
+    EIGEN_MAKE_ALIGNED_OPERATOR_NEW     // ensure proper alignment
+  } EIGEN_ALIGN16;
+
+}; // namespace scan_line_run
+
+#define SLRPointXYZIRL scan_line_run::PointXYZIRL
 #define VPoint velodyne_pointcloud::PointXYZIR
+#define RUN pcl::PointCloud<SLRPointXYZIRL>
+// Register custom point struct according to PCL
+POINT_CLOUD_REGISTER_POINT_STRUCT(scan_line_run::PointXYZIRL,
+                                  (float, x, x)
+                                  (float, y, y)
+                                  (float, z, z)
+                                  (float, intensity, intensity)
+                                  (uint16_t, ring, ring)
+                                  (uint16_t, label, label))
+
 // using eigen lib
 #include <Eigen/Dense>
 using Eigen::MatrixXf;
@@ -33,6 +63,8 @@ using Eigen::VectorXf;
 pcl::PointCloud<VPoint>::Ptr g_seeds_pc(new pcl::PointCloud<VPoint>());
 pcl::PointCloud<VPoint>::Ptr g_ground_pc(new pcl::PointCloud<VPoint>());
 pcl::PointCloud<VPoint>::Ptr g_not_ground_pc(new pcl::PointCloud<VPoint>());
+pcl::PointCloud<SLRPointXYZIRL>::Ptr g_all_pc(new pcl::PointCloud<SLRPointXYZIRL>());
+
 
 /*
     @brief Compare function to sort points. Here use z axis.
@@ -61,6 +93,7 @@ private:
     ros::Subscriber points_node_sub_;
     ros::Publisher ground_points_pub_;
     ros::Publisher groundless_points_pub_;
+    ros::Publisher all_points_pub_;
 
     std::string point_topic_;
 
@@ -128,7 +161,7 @@ GroundPlaneFit::GroundPlaneFit():node_handle_("~"){
     ROS_INFO("Only Ground Output Point Cloud: %s", ground_topic.c_str());
     groundless_points_pub_ = node_handle_.advertise<sensor_msgs::PointCloud2>(no_ground_topic, 2);
     ground_points_pub_ = node_handle_.advertise<sensor_msgs::PointCloud2>(ground_topic, 2);
- 
+    all_points_pub_ =  node_handle_.advertise<sensor_msgs::PointCloud2>("/all_points", 2);
 }
 
 /*
@@ -144,45 +177,18 @@ GroundPlaneFit::GroundPlaneFit():node_handle_("~"){
     
 */
 void GroundPlaneFit::estimate_plane_(void){
-    // Create covarian matrix.
-    // 1. calculate (x,y,z) mean
-    float x_mean = 0, y_mean = 0, z_mean = 0;
-    for(int i=0;i<g_ground_pc->points.size();i++){
-        x_mean += g_ground_pc->points[i].x;
-        y_mean += g_ground_pc->points[i].y;
-        z_mean += g_ground_pc->points[i].z;
-    }
-    // incase of divide zero
-    int size = g_ground_pc->points.size()!=0?g_ground_pc->points.size():1;
-    x_mean /= size;
-    y_mean /= size;
-    z_mean /= size;
-    // 2. calculate covariance
-    // cov(x,x), cov(y,y), cov(z,z)
-    // cov(x,y), cov(x,z), cov(y,z)
-    float xx = 0, yy = 0, zz = 0;
-    float xy = 0, xz = 0, yz = 0;
-    for(int i=0;i<g_ground_pc->points.size();i++){
-        xx += (g_ground_pc->points[i].x-x_mean)*(g_ground_pc->points[i].x-x_mean);
-        xy += (g_ground_pc->points[i].x-x_mean)*(g_ground_pc->points[i].y-y_mean);
-        xz += (g_ground_pc->points[i].x-x_mean)*(g_ground_pc->points[i].z-z_mean);
-        yy += (g_ground_pc->points[i].y-y_mean)*(g_ground_pc->points[i].y-y_mean);
-        yz += (g_ground_pc->points[i].y-y_mean)*(g_ground_pc->points[i].z-z_mean);
-        zz += (g_ground_pc->points[i].z-z_mean)*(g_ground_pc->points[i].z-z_mean);
-    }
-    // 3. setup covarian matrix cov
-    MatrixXf cov(3,3);
-    cov << xx,xy,xz,
-           xy, yy, yz,
-           xz, yz, zz;
-    cov /= size;
+    // Create covarian matrix in single pass.
+    // TODO: compare the efficiency.
+    Eigen::Matrix3f cov;
+    Eigen::Vector4f pc_mean;
+    pcl::computeMeanAndCovarianceMatrix(*g_ground_pc, cov, pc_mean);
     // Singular Value Decomposition: SVD
     JacobiSVD<MatrixXf> svd(cov,Eigen::DecompositionOptions::ComputeFullU);
     // use the least singular vector as normal
     normal_ = (svd.matrixU().col(2));
     // mean ground seeds value
-    MatrixXf seeds_mean(3,1);
-    seeds_mean<<x_mean,y_mean,z_mean;
+    Eigen::Vector3f seeds_mean = pc_mean.head<3>();
+
     // according to normal.T*[x,y,z] = -d
     d_ = -(normal_.transpose()*seeds_mean)(0,0);
     // set distance threhold to `th_dist - d`
@@ -232,8 +238,21 @@ void GroundPlaneFit::velodyne_callback_(const sensor_msgs::PointCloud2ConstPtr& 
     // 1.Msg to pointcloud
     pcl::PointCloud<VPoint> laserCloudIn;
     pcl::fromROSMsg(*in_cloud_msg, laserCloudIn);
-    std::vector<int> indices;
-    pcl::removeNaNFromPointCloud(laserCloudIn, laserCloudIn,indices);
+    pcl::PointCloud<VPoint> laserCloudIn_org;
+    pcl::fromROSMsg(*in_cloud_msg, laserCloudIn_org);
+    // For mark ground points and hold all points
+    SLRPointXYZIRL point;
+    for(size_t i=0;i<laserCloudIn.points.size();i++){
+        point.x = laserCloudIn.points[i].x;
+        point.y = laserCloudIn.points[i].y;
+        point.z = laserCloudIn.points[i].z;
+        point.intensity = laserCloudIn.points[i].intensity;
+        point.ring = laserCloudIn.points[i].ring;
+        point.label = 0u;// 0 means uncluster
+        g_all_pc->points.push_back(point);
+    }
+    //std::vector<int> indices;
+    //pcl::removeNaNFromPointCloud(laserCloudIn, laserCloudIn,indices);
     // 2.Sort on Z-axis value.
     sort(laserCloudIn.points.begin(),laserCloudIn.end(),point_cmp);
     // 3.Error point removal
@@ -260,9 +279,9 @@ void GroundPlaneFit::velodyne_callback_(const sensor_msgs::PointCloud2ConstPtr& 
         g_not_ground_pc->clear();
 
         //pointcloud to matrix
-        MatrixXf points(laserCloudIn.points.size(),3);
+        MatrixXf points(laserCloudIn_org.points.size(),3);
         int j =0;
-        for(auto p:laserCloudIn.points){
+        for(auto p:laserCloudIn_org.points){
             points.row(j++)<<p.x,p.y,p.z;
         }
         // ground plane model
@@ -270,12 +289,15 @@ void GroundPlaneFit::velodyne_callback_(const sensor_msgs::PointCloud2ConstPtr& 
         // threshold filter
         for(int r=0;r<result.rows();r++){
             if(result[r]<th_dist_d_){
-                g_ground_pc->points.push_back(laserCloudIn[r]);
+                g_all_pc->points[r].label = 1u;// means ground
+                g_ground_pc->points.push_back(laserCloudIn_org[r]);
             }else{
-                g_not_ground_pc->points.push_back(laserCloudIn[r]);
+                g_all_pc->points[r].label = 0u;// means not ground and non clusterred
+                g_not_ground_pc->points.push_back(laserCloudIn_org[r]);
             }
         }
     }
+
 
     // publish ground points
     sensor_msgs::PointCloud2 ground_msg;
@@ -289,7 +311,13 @@ void GroundPlaneFit::velodyne_callback_(const sensor_msgs::PointCloud2ConstPtr& 
     groundless_msg.header.stamp = in_cloud_msg->header.stamp;
     groundless_msg.header.frame_id = in_cloud_msg->header.frame_id;
     groundless_points_pub_.publish(groundless_msg);
-    
+    // publish all points
+    sensor_msgs::PointCloud2 all_points_msg;
+    pcl::toROSMsg(*g_all_pc, all_points_msg);
+    all_points_msg.header.stamp = in_cloud_msg->header.stamp;
+    all_points_msg.header.frame_id = in_cloud_msg->header.frame_id;
+    all_points_pub_.publish(all_points_msg);
+    g_all_pc->clear();
 }
 
 int main(int argc, char **argv)
